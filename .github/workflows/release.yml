@@ -1,0 +1,43 @@
+name: Build and release
+
+# Push a tag like v1.0.1 to build HeartRatePresence.exe and attach it to a GitHub release.
+# Every other push just builds and tests it.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: powershell
+        run: ./build.ps1
+
+      - name: Self-test
+        shell: powershell
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'selftest.txt'
+          $p = Start-Process dist/HeartRatePresence.exe -ArgumentList '--selftest', "`"$out`"" -Wait -PassThru
+          Get-Content $out
+          if ($p.ExitCode -ne 0) { throw "self-test failed ($($p.ExitCode))" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HeartRatePresence
+          path: dist/HeartRatePresence.exe
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/HeartRatePresence.exe
+          generate_release_notes: true
