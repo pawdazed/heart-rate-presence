@@ -42,6 +42,18 @@ That's it. It installs itself (no admin needed), adds itself to the Start menu, 
 
 **Needs:** Windows 10 or 11 with Bluetooth, the Discord desktop app, an Apple Watch and iPhone. A Bluetooth chest strap works too, instead of the watch.
 
+## Keep it running all day
+
+1. Connect once with HeartCast open on your iPhone.
+2. Settings → **Pair with Windows** (tap **Pair** when your iPhone asks).
+
+After that you can put the phone away. If the connection drops (PC sleeps, you walk out of range), it reconnects by itself as soon as you're back,
+even with HeartCast in the background. While it's disconnected, your profile shows "💤 heart rate paused" (you can change that text, or hide the status instead).
+It keeps going until you press **Stop**.
+
+The one real limit: an Apple Watch only streams heart rate continuously while a workout is running (that's how HeartCast works), and that uses
+more battery than normal. Charge the watch when it's low and restart HeartCast on it.
+
 ## Customize it
 
 Open the app (Start menu → Heart Rate Presence):
@@ -60,8 +72,9 @@ Everyone using the built-in Discord app shows the same name after "Playing". To 
 ## Troubleshooting
 
 * **"Looking for a Bluetooth heart rate monitor" forever:** bring HeartCast to the front **on your iPhone**. iPhones hide the
-  heart-rate signal from Windows while the app is in the background. Once it's connected, it keeps going in the background.
+  heart-rate signal from Windows while the app is in the background, unless you've paired (see above). Once it's connected, it keeps going in the background.
   Still nothing? Type part of the device's name (for example `HeartCast`) into Settings → Bluetooth device name.
+* **Updating:** download the new `HeartRatePresence.exe` and open it. It offers to close the running copy and updates it in place. Your settings are kept.
 * **Nothing shows on Discord:** in Discord, go to User Settings → Activity Privacy and turn on "Share my activity". Also make sure you're not set to Invisible.
 * **The number lags a bit:** Discord allows about one status update every 4 seconds.
 * **Other heart rate sources:** Settings → Source also supports HypeRate (free API key, which takes a couple of days), Pulsoid (paid BRO plan),

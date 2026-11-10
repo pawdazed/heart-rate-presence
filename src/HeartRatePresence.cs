@@ -54,6 +54,10 @@ namespace HeartRatePresence
         public string DiscordClientId { get; set; }
         public string Source { get; set; }          // "Bluetooth", "HypeRate", "Pulsoid" or "LocalHttp"
         public string BleNameFilter { get; set; }
+        public string BlePairedId { get; set; }     // Windows device id of a paired phone/strap
+        public string BlePairedName { get; set; }
+        public bool HideWhenNoSignal { get; set; }  // false = keep the status up with NoSignalText
+        public string NoSignalText { get; set; }
         public string HypeRateKey { get; set; }
         public string HypeRateId { get; set; }
         public string PulsoidToken { get; set; }
@@ -84,12 +88,18 @@ namespace HeartRatePresence
 
         public static string Img(string name) { return AppInfo.AssetBase + name + ".png"; }
 
+        public const string DefaultNoSignalText = "\U0001F4A4 heart rate paused";
+
         public static AppConfig CreateDefault()
         {
             var c = new AppConfig();
             c.DiscordClientId = "";
             c.Source = "Bluetooth";
             c.BleNameFilter = "";
+            c.BlePairedId = "";
+            c.BlePairedName = "";
+            c.HideWhenNoSignal = false;
+            c.NoSignalText = DefaultNoSignalText;
             c.HypeRateKey = "";
             c.HypeRateId = "";
             c.PulsoidToken = "";
@@ -141,6 +151,9 @@ namespace HeartRatePresence
                 if (c.DiscordClientId == null) c.DiscordClientId = "";
                 if (c.Source != "LocalHttp" && c.Source != "Pulsoid" && c.Source != "HypeRate") c.Source = "Bluetooth";
                 if (c.BleNameFilter == null) c.BleNameFilter = "";
+                if (c.BlePairedId == null) c.BlePairedId = "";
+                if (c.BlePairedName == null) c.BlePairedName = "";
+                if (string.IsNullOrWhiteSpace(c.NoSignalText)) c.NoSignalText = DefaultNoSignalText;
                 if (c.Theme != "Light" && c.Theme != "Dark") c.Theme = "System";
                 if (c.HypeRateKey == null) c.HypeRateKey = "";
                 if (c.HypeRateId == null) c.HypeRateId = "";
@@ -342,6 +355,27 @@ namespace HeartRatePresence
             return a;
         }
 
+        /// <summary>What the profile shows while the watch is disconnected (if the user keeps the status up).</summary>
+        public static Dictionary<string, object> BuildNoSignal(AppConfig cfg, long? startUnix)
+        {
+            var a = new Dictionary<string, object>();
+            a["type"] = TypeValues.Contains(cfg.ActivityType) ? cfg.ActivityType : 0;
+            a["status_display_type"] = Math.Max(0, Math.Min(2, cfg.StatusDisplay));
+            var d = Txt(string.IsNullOrWhiteSpace(cfg.NoSignalText) ? AppConfig.DefaultNoSignalText : cfg.NoSignalText.Trim());
+            if (d != null) a["details"] = d;
+            var tiers = Sorted(cfg);
+            var img = tiers.Count > 0 ? Img(tiers[0].LargeImage) : null;
+            if (img != null)
+                a["assets"] = new Dictionary<string, object> { { "large_image", img }, { "large_text", "no heart rate right now" } };
+            if (startUnix.HasValue)
+                a["timestamps"] = new Dictionary<string, object> { { "start", startUnix.Value } };
+            var buttons = new List<object>();
+            AddButton(buttons, cfg.Button1Label, cfg.Button1Url);
+            AddButton(buttons, cfg.Button2Label, cfg.Button2Url);
+            if (buttons.Count > 0) a["buttons"] = buttons;
+            return a;
+        }
+
         static void AddButton(List<object> list, string label, string url)
         {
             if (string.IsNullOrWhiteSpace(label) || string.IsNullOrWhiteSpace(url)) return;
@@ -501,6 +535,8 @@ namespace HeartRatePresence
         readonly object sync = new object();
         int bpm; DateTime bpmAt = DateTime.MinValue;
         CancellationTokenSource cts; Thread worker; DateTime sessionStart;
+        volatile bool hadData;
+        public bool HadData { get { return hadData; } }
 
         public bool Running { get { return cts != null; } }
 
@@ -508,6 +544,7 @@ namespace HeartRatePresence
         {
             if (v < 20 || v > 260) return;
             lock (sync) { bpm = v; bpmAt = DateTime.UtcNow; }
+            hadData = true;
         }
 
         public int LiveBpm()
@@ -534,6 +571,7 @@ namespace HeartRatePresence
             var cfg = Config;
             sessionStart = DateTime.UtcNow;
             lock (sync) { bpm = 0; }
+            hadData = false;
             if (cfg.Source == "LocalHttp") Task.Run(() => HttpLoop(cfg.HttpPort, ct));
             else if (cfg.Source == "Pulsoid") Task.Run(() => PulsoidLoop((cfg.PulsoidToken ?? "").Trim(), ct));
             else if (cfg.Source == "Bluetooth") Task.Run(() => BleLoop(cfg.BleNameFilter, ct));
@@ -587,7 +625,11 @@ namespace HeartRatePresence
                     }
                     var cfg = Config;
                     int b = CurrentBpm();
-                    var act = b > 0 ? Presence.BuildActivity(cfg, b, cfg.ShowElapsed ? (long?)ToUnix(sessionStart) : null) : null;
+                    long? start = cfg.ShowElapsed ? (long?)ToUnix(sessionStart) : null;
+                    if (b > 0) hadData = true;
+                    // Once the watch has sent anything, keep the status up through drop-outs until the user presses Stop.
+                    bool noSignal = b == 0 && hadData && !cfg.HideWhenNoSignal;
+                    var act = b > 0 ? Presence.BuildActivity(cfg, b, start) : noSignal ? Presence.BuildNoSignal(cfg, start) : null;
                     string key = act == null ? "null" : ser.Serialize(act);
                     if (key != lastKey && (DateTime.UtcNow - lastSend).TotalSeconds >= Math.Max(4, cfg.UpdateIntervalSec))
                     {
@@ -596,6 +638,7 @@ namespace HeartRatePresence
                         lastKey = key;
                         if (err != null) SetDiscord(ct, "Discord rejected the update: " + err);
                         else if (act == null) SetDiscord(ct, "Connected as " + ipc.UserName + ". No heart rate yet, so your status is hidden.");
+                        else if (noSignal) SetDiscord(ct, "Watch disconnected. " + ipc.UserName + "'s profile shows the no-signal text until it's back.");
                         else SetDiscord(ct, "Live on " + ipc.UserName + "'s profile: " + b + " BPM (sent " + DateTime.Now.ToString("HH:mm:ss") + ")");
                     }
                 }
@@ -708,59 +751,66 @@ namespace HeartRatePresence
             return b[1];
         }
 
+        // what the UI shows / pairs with while connected
+        public volatile string BleLiveName;
+        volatile BluetoothLEDevice bleLiveDevice;
+        public bool BleConnected { get { return bleLiveDevice != null; } }
+
         async Task BleLoop(string filter, CancellationToken ct)
         {
             filter = (filter ?? "").Trim();
+            ulong lastAddr = 0;
+            string lastName = null;
             while (!ct.IsCancellationRequested)
             {
                 BluetoothLEDevice dev = null;
-                GattDeviceService svc = null;
-                GattCharacteristic ch = null;
-                Windows.Foundation.TypedEventHandler<GattCharacteristic, GattValueChangedEventArgs> onValue = null;
+                string devName = null;
                 try
                 {
+                    // 1) a device paired with Windows: Windows recognises it even after an iPhone
+                    //    changes its Bluetooth address, and while HeartCast is in the background.
+                    var cfg = Config;
+                    if (!string.IsNullOrEmpty(cfg.BlePairedId))
+                    {
+                        devName = string.IsNullOrEmpty(cfg.BlePairedName) ? "your paired device" : cfg.BlePairedName;
+                        SetSource(ct, "Reconnecting to " + devName + "…");
+                        dev = await TryOpen(() => BluetoothLEDevice.FromIdAsync(cfg.BlePairedId), ct);
+                        if (dev != null && !await StreamFrom(dev, devName, ct)) { dev.Dispose(); dev = null; }
+                        else if (dev != null) { lastAddr = dev.BluetoothAddress; lastName = devName; continue; }
+                    }
+
+                    // 2) the device we were connected to a moment ago (works until an iPhone rotates its address)
+                    if (lastAddr != 0)
+                    {
+                        devName = lastName;
+                        SetSource(ct, "Reconnecting to " + devName + "…");
+                        ulong a = lastAddr;
+                        dev = await TryOpen(() => BluetoothLEDevice.FromBluetoothAddressAsync(a), ct);
+                        if (dev != null && await StreamFrom(dev, devName, ct)) continue;
+                        if (dev != null) { dev.Dispose(); dev = null; }
+                    }
+
+                    // 3) scan for anything advertising heart rate
+                    bool haveFallback = !string.IsNullOrEmpty(Config.BlePairedId) || lastAddr != 0;
                     SetSource(ct, "Looking for a Bluetooth heart rate monitor" + (filter.Length > 0 ? " named “" + filter + "”" : "") +
-                                  "… Start HeartCast on your watch and keep HeartCast open on your iPhone.");
-                    var found = await FindHrDevice(filter, ct);
-                    string devName = found.Item2;
+                                  "… Start HeartCast on your watch and open HeartCast on your iPhone." +
+                                  (string.IsNullOrEmpty(Config.BlePairedId) ? "" : " (Your paired phone reconnects by itself once it's in range.)"));
+                    Tuple<ulong, string> found;
+                    using (var scan = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                    {
+                        if (haveFallback) scan.CancelAfter(TimeSpan.FromSeconds(25));
+                        try { found = await FindHrDevice(filter, scan.Token); }
+                        catch (OperationCanceledException) { if (ct.IsCancellationRequested) break; continue; }
+                    }
+                    devName = found.Item2;
                     SetSource(ct, "Found " + devName + ". Connecting…");
                     dev = await WinRt.Await(BluetoothLEDevice.FromBluetoothAddressAsync(found.Item1), ct);
                     if (dev == null) throw new Exception("Windows couldn't open " + devName + ".");
-                    var sr = await WinRt.Await(dev.GetGattServicesForUuidAsync(HrService, BluetoothCacheMode.Uncached), ct);
-                    if (sr.Status != GattCommunicationStatus.Success || sr.Services.Count == 0)
-                        throw new Exception(devName + " didn't offer heart rate (" + sr.Status + ").");
-                    svc = sr.Services[0];
-                    var cr = await WinRt.Await(svc.GetCharacteristicsForUuidAsync(HrMeasurement, BluetoothCacheMode.Uncached), ct);
-                    if (cr.Status != GattCommunicationStatus.Success || cr.Characteristics.Count == 0)
-                        throw new Exception(devName + " didn't offer heart rate readings (" + cr.Status + ").");
-                    ch = cr.Characteristics[0];
-
-                    long lastTicks = DateTime.UtcNow.Ticks;
-                    onValue = (s, a) =>
-                    {
-                        int hr = ParseHrMeasurement(WinRt.Bytes(a.CharacteristicValue));
-                        if (hr <= 0) return;
-                        Interlocked.Exchange(ref lastTicks, DateTime.UtcNow.Ticks);
-                        PushBpm(hr);
-                        SetSource(ct, "Receiving from " + devName + " over Bluetooth: " + hr + " BPM (" + DateTime.Now.ToString("HH:mm:ss") + ")");
-                    };
-                    ch.ValueChanged += onValue;
-                    var st = await WinRt.Await(ch.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue.Notify), ct);
-                    if (st != GattCommunicationStatus.Success) throw new Exception("Couldn't subscribe to " + devName + " (" + st + ").");
-                    SetSource(ct, "Connected to " + devName + " over Bluetooth. Waiting for heart rate…");
-                    Interlocked.Exchange(ref lastTicks, DateTime.UtcNow.Ticks);
-
-                    while (!ct.IsCancellationRequested)
-                    {
-                        await Task.Delay(1000, ct);
-                        if ((DateTime.UtcNow - new DateTime(Interlocked.Read(ref lastTicks))).TotalSeconds > 20)
-                        {
-                            SetSource(ct, devName + " stopped sending. Looking for it again…");
-                            break;
-                        }
-                    }
+                    if (!string.IsNullOrEmpty(dev.Name)) devName = dev.Name;
+                    if (await StreamFrom(dev, devName, ct)) { lastAddr = found.Item1; lastName = devName; }
+                    else throw new Exception(devName + " didn't send heart rate.");
                 }
-                catch (OperationCanceledException) { break; }
+                catch (OperationCanceledException) { if (ct.IsCancellationRequested) break; }
                 catch (Exception ex)
                 {
                     if (ct.IsCancellationRequested) break;
@@ -769,11 +819,137 @@ namespace HeartRatePresence
                 }
                 finally
                 {
-                    try { if (ch != null && onValue != null) ch.ValueChanged -= onValue; } catch { }
-                    try { if (svc != null) svc.Dispose(); } catch { }
                     try { if (dev != null) dev.Dispose(); } catch { }
                 }
             }
+        }
+
+        /// <summary>Opens a device object, giving up after 15 s. Returns null if it can't.</summary>
+        static async Task<BluetoothLEDevice> TryOpen(Func<Windows.Foundation.IAsyncOperation<BluetoothLEDevice>> open, CancellationToken ct)
+        {
+            using (var t = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                t.CancelAfter(TimeSpan.FromSeconds(15));
+                try { return await WinRt.Await(open(), t.Token); }
+                catch (OperationCanceledException) { if (ct.IsCancellationRequested) throw; return null; }
+                catch { return null; }
+            }
+        }
+
+        /// <summary>
+        /// Subscribes to heart rate and keeps reading until the device goes quiet.
+        /// Returns false if it couldn't subscribe at all, true once a session ended after working.
+        /// </summary>
+        async Task<bool> StreamFrom(BluetoothLEDevice dev, string devName, CancellationToken ct)
+        {
+            GattDeviceService svc = null;
+            GattCharacteristic ch = null;
+            Windows.Foundation.TypedEventHandler<GattCharacteristic, GattValueChangedEventArgs> onValue = null;
+            try
+            {
+                GattDeviceServicesResult sr;
+                using (var t = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                {
+                    t.CancelAfter(TimeSpan.FromSeconds(30));
+                    try { sr = await WinRt.Await(dev.GetGattServicesForUuidAsync(HrService, BluetoothCacheMode.Uncached), t.Token); }
+                    catch (OperationCanceledException) { if (ct.IsCancellationRequested) throw; return false; }
+                }
+                if (sr.Status != GattCommunicationStatus.Success || sr.Services.Count == 0) return false;
+                svc = sr.Services[0];
+                var cr = await WinRt.Await(svc.GetCharacteristicsForUuidAsync(HrMeasurement, BluetoothCacheMode.Uncached), ct);
+                if (cr.Status != GattCommunicationStatus.Success || cr.Characteristics.Count == 0) return false;
+                ch = cr.Characteristics[0];
+
+                long lastTicks = DateTime.UtcNow.Ticks;
+                onValue = (s, a) =>
+                {
+                    int hr = ParseHrMeasurement(WinRt.Bytes(a.CharacteristicValue));
+                    if (hr <= 0) return;
+                    Interlocked.Exchange(ref lastTicks, DateTime.UtcNow.Ticks);
+                    PushBpm(hr);
+                    SetSource(ct, "Receiving from " + devName + " over Bluetooth: " + hr + " BPM (" + DateTime.Now.ToString("HH:mm:ss") + ")");
+                };
+                ch.ValueChanged += onValue;
+                var st = await WinRt.Await(ch.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue.Notify), ct);
+                if (st != GattCommunicationStatus.Success) return false;
+
+                bleLiveDevice = dev;
+                BleLiveName = devName;
+                SetSource(ct, "Connected to " + devName + " over Bluetooth. Waiting for heart rate…");
+                Interlocked.Exchange(ref lastTicks, DateTime.UtcNow.Ticks);
+                while (!ct.IsCancellationRequested)
+                {
+                    await Task.Delay(1000, ct);
+                    if ((DateTime.UtcNow - new DateTime(Interlocked.Read(ref lastTicks))).TotalSeconds > 20)
+                    {
+                        SetSource(ct, devName + " stopped sending. Reconnecting…");
+                        break;
+                    }
+                }
+                return true;
+            }
+            finally
+            {
+                bleLiveDevice = null;
+                BleLiveName = null;
+                try { if (ch != null && onValue != null) ch.ValueChanged -= onValue; } catch { }
+                try { if (svc != null) svc.Dispose(); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// Pairs the currently connected device with Windows so it can reconnect later even when
+        /// an iPhone is in the background. confirmPin shows a code and returns whether the user accepted.
+        /// Returns (deviceId, name) on success, or throws with a readable message.
+        /// </summary>
+        public async Task<Tuple<string, string>> PairLiveDeviceAsync(Func<string, bool> confirmPin)
+        {
+            var dev = bleLiveDevice;
+            if (dev == null) throw new Exception("Connect to your phone or strap first (the Live tab should say “Receiving”).");
+            var info = dev.DeviceInformation;
+            string name = BleLiveName ?? dev.Name;
+            if (info.Pairing.IsPaired) return Tuple.Create(dev.DeviceId, name);
+            if (!info.Pairing.CanPair) throw new Exception(name + " doesn't allow pairing.");
+
+            var custom = info.Pairing.Custom;
+            Windows.Foundation.TypedEventHandler<Windows.Devices.Enumeration.DeviceInformationCustomPairing, Windows.Devices.Enumeration.DevicePairingRequestedEventArgs> onRequest =
+                (s, a) =>
+                {
+                    var deferral = a.GetDeferral();
+                    try
+                    {
+                        if (a.PairingKind == Windows.Devices.Enumeration.DevicePairingKinds.ConfirmOnly) a.Accept();
+                        else if (confirmPin(a.Pin)) a.Accept();
+                    }
+                    finally { deferral.Complete(); }
+                };
+            custom.PairingRequested += onRequest;
+            try
+            {
+                var kinds = Windows.Devices.Enumeration.DevicePairingKinds.ConfirmOnly |
+                            Windows.Devices.Enumeration.DevicePairingKinds.ConfirmPinMatch |
+                            Windows.Devices.Enumeration.DevicePairingKinds.DisplayPin;
+                var result = await WinRt.Await(custom.PairAsync(kinds, Windows.Devices.Enumeration.DevicePairingProtectionLevel.Encryption), CancellationToken.None);
+                if (result.Status == Windows.Devices.Enumeration.DevicePairingResultStatus.Paired ||
+                    result.Status == Windows.Devices.Enumeration.DevicePairingResultStatus.AlreadyPaired)
+                    return Tuple.Create(dev.DeviceId, name);
+                throw new Exception("Pairing didn't finish (" + result.Status + ").");
+            }
+            finally { custom.PairingRequested -= onRequest; }
+        }
+
+        public static async Task UnpairAsync(string deviceId)
+        {
+            if (string.IsNullOrEmpty(deviceId)) return;
+            try
+            {
+                var dev = await WinRt.Await(BluetoothLEDevice.FromIdAsync(deviceId), CancellationToken.None);
+                if (dev == null) return;
+                using (dev)
+                    if (dev.DeviceInformation.Pairing.IsPaired)
+                        await WinRt.Await(dev.DeviceInformation.Pairing.UnpairAsync(), CancellationToken.None);
+            }
+            catch { }
         }
 
         /// <summary>Scans until a device advertising the heart rate service (or matching the name filter) shows up.</summary>
@@ -1369,7 +1545,10 @@ namespace HeartRatePresence
         DataGridView grid;
         BindingList<Tier> tiers;
 
-        TextBox txtHrKey, txtHrId, txtBleName;
+        TextBox txtHrKey, txtHrId, txtBleName, txtNoSignal;
+        CheckBox chkKeepUp;
+        Label lblPaired;
+        Button btnPair, btnForget;
         static readonly string[] SourceKeys = { "Bluetooth", "HypeRate", "Pulsoid", "LocalHttp" };
         CheckBox chkShowHrKey;
         TextBox txtClientId, txtToken, txtB1L, txtB1U, txtB2L, txtB2U;
@@ -1485,6 +1664,61 @@ namespace HeartRatePresence
         }
 
         bool quitting;
+
+        void UpdatePairUi()
+        {
+            if (lblPaired == null) return;
+            bool paired = !string.IsNullOrEmpty(cfg.BlePairedId);
+            string text = paired
+                ? cfg.BlePairedName + "  (reconnects by itself, even in the background)"
+                : engine.BleConnected ? "not paired: click Pair to keep " + engine.BleLiveName + " connected in the background"
+                                      : "none yet (connect once, then click Pair)";
+            if (lblPaired.Text != text) lblPaired.Text = text;
+            bool canPair = !paired && engine.BleConnected && !pairing;
+            if (btnPair.Enabled != canPair) btnPair.Enabled = canPair;
+            if (btnForget.Enabled != paired) btnForget.Enabled = paired;
+        }
+
+        bool pairing;
+
+        async Task PairClicked()
+        {
+            pairing = true;
+            UpdatePairUi();
+            lblPaired.Text = "Pairing… check your iPhone for a Bluetooth pairing request and tap Pair.";
+            try
+            {
+                var result = await engine.PairLiveDeviceAsync(pin => (bool)Invoke(new Func<bool>(() =>
+                    MessageBox.Show(this, "Does your iPhone show this code?\n\n" + pin + "\n\nTap Pair on your iPhone, then click Yes here.",
+                        Text, MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)));
+                cfg.BlePairedId = result.Item1;
+                cfg.BlePairedName = result.Item2;
+                SaveAll(false);
+                MessageBox.Show(this, result.Item2 + " is paired. From now on it reconnects by itself, even with HeartCast in the background, as long as HeartCast is running on your watch.",
+                    Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Couldn't pair: " + ex.Message + "\n\nIt still works without pairing; it just needs HeartCast open on your iPhone to reconnect after a long drop-out.",
+                    Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            finally
+            {
+                pairing = false;
+                UpdatePairUi();
+            }
+        }
+
+        async Task ForgetClicked()
+        {
+            string id = cfg.BlePairedId;
+            if (MessageBox.Show(this, "Forget " + cfg.BlePairedName + " and unpair it from Windows?", Text, MessageBoxButtons.YesNo) != DialogResult.Yes) return;
+            cfg.BlePairedId = "";
+            cfg.BlePairedName = "";
+            SaveAll(false);
+            UpdatePairUi();
+            await Engine.UnpairAsync(id);
+        }
 
         void SelectPage(int i)
         {
@@ -1640,14 +1874,30 @@ namespace HeartRatePresence
                 lblTier.ForeColor = Theme.Current.Muted;
             }
 
-            preview.Empty = r == null;
+            bool noSignal = r == null && engine.Running && engine.HadData && !ec.HideWhenNoSignal;
+            if (noSignal)
+            {
+                lblTier.Text = "watch disconnected, reconnecting…";
+            }
+            preview.Empty = r == null && !noSignal;
             int ti = Array.IndexOf(Presence.TypeValues, ec.ActivityType);
             preview.Header = (ti >= 0 ? Presence.TypeNames[ti] : "Playing").ToUpperInvariant();
             preview.AppName = !string.IsNullOrEmpty(engine.AppName) ? engine.AppName : "Heart Rate";
-            if (r != null)
+            if (r != null || noSignal)
             {
-                preview.Details = r.Details; preview.State = r.State;
-                preview.LargeImage = r.LargeImage; preview.SmallImage = r.SmallImage;
+                if (r != null)
+                {
+                    preview.Details = r.Details; preview.State = r.State;
+                    preview.LargeImage = r.LargeImage; preview.SmallImage = r.SmallImage;
+                }
+                else
+                {
+                    var tiers0 = Presence.Sorted(ec);
+                    preview.Details = string.IsNullOrWhiteSpace(ec.NoSignalText) ? AppConfig.DefaultNoSignalText : ec.NoSignalText;
+                    preview.State = "";
+                    preview.LargeImage = tiers0.Count > 0 ? tiers0[0].LargeImage : "";
+                    preview.SmallImage = "";
+                }
                 if (ec.ShowElapsed)
                 {
                     var el = DateTime.UtcNow - previewStart;
@@ -1662,8 +1912,9 @@ namespace HeartRatePresence
                 : engine.SourceStatus;
             lblDiscord.Text = engine.DiscordStatus;
             btnStart.Text = engine.Running ? "Stop" : "Start";
+            UpdatePairUi();
 
-            string tip = engine.Running ? (bpm > 0 ? "♥ " + bpm + " BPM" : "♥ waiting for heart rate") : "Heart Rate Presence (stopped)";
+            string tip = engine.Running ? (bpm > 0 ? "♥ " + bpm + " BPM" : noSignal ? "♥ watch disconnected, reconnecting" : "♥ waiting for heart rate") : "Heart Rate Presence (stopped)";
             if (tray.Text != tip) tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
         }
 
@@ -1792,7 +2043,12 @@ namespace HeartRatePresence
             numInterval = Num(4, 60);
             Row("Update every (seconds)", numInterval, Hint("Discord's limit: 4 s"));
             numStale = Num(5, 600);
-            Row("Hide status after no data for (s)", numStale, null);
+            Row("Disconnected after no data for (s)", numStale, null);
+            chkKeepUp = new CheckBox { Text = "Keep my status up while disconnected", AutoSize = true };
+            Row("", chkKeepUp, null);
+            txtNoSignal = new TextBox { Dock = DockStyle.Fill };
+            Row("Disconnected text", txtNoSignal, Hint("shown instead of your BPM"));
+            chkKeepUp.CheckedChanged += (s, e) => txtNoSignal.Enabled = chkKeepUp.Checked;
 
             Section("Heart rate source");
             cmbSource = Combo(new[]
@@ -1806,6 +2062,15 @@ namespace HeartRatePresence
             Row("Source", cmbSource, null);
             txtBleName = new TextBox { Dock = DockStyle.Fill };
             Row("Bluetooth device name", txtBleName, Hint("optional, blank = first one found"));
+            lblPaired = new Label { AutoSize = true, Margin = new Padding(0, S(6), 0, S(3)) };
+            btnPair = new Button { Text = "Pair with Windows", AutoSize = true, Margin = new Padding(S(6), S(1), 0, S(1)) };
+            btnForget = new Button { Text = "Forget", AutoSize = true, Margin = new Padding(S(6), S(1), 0, S(1)) };
+            btnPair.Click += async (s, e) => await PairClicked();
+            btnForget.Click += async (s, e) => await ForgetClicked();
+            var pairButtons = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0) };
+            pairButtons.Controls.Add(btnPair);
+            pairButtons.Controls.Add(btnForget);
+            Row("Paired device", lblPaired, pairButtons);
             txtHrKey = new TextBox { Dock = DockStyle.Fill, UseSystemPasswordChar = true };
             chkShowHrKey = new CheckBox { Text = "show", AutoSize = true, Margin = new Padding(S(6), S(5), 0, 0) };
             chkShowHrKey.CheckedChanged += (s, e) => txtHrKey.UseSystemPasswordChar = !chkShowHrKey.Checked;
@@ -1951,6 +2216,9 @@ namespace HeartRatePresence
             txtB2L.Text = cfg.Button2Label; txtB2U.Text = cfg.Button2Url;
             chkAutoStart.Checked = cfg.AutoStart;
             chkTray.Checked = cfg.MinimizeToTray;
+            chkKeepUp.Checked = !cfg.HideWhenNoSignal;
+            txtNoSignal.Text = cfg.NoSignalText;
+            txtNoSignal.Enabled = chkKeepUp.Checked;
             cmbTheme.SelectedIndex = Math.Max(0, Array.IndexOf(Theme.PrefKeys, cfg.Theme));
             SetTiers(cfg.Tiers.Select(t => t).ToList());
             UpdateSourceEnabled();
@@ -1975,6 +2243,8 @@ namespace HeartRatePresence
             cfg.Button2Label = txtB2L.Text; cfg.Button2Url = txtB2U.Text;
             cfg.AutoStart = chkAutoStart.Checked;
             cfg.MinimizeToTray = chkTray.Checked;
+            cfg.HideWhenNoSignal = !chkKeepUp.Checked;
+            cfg.NoSignalText = txtNoSignal.Text;
             cfg.Theme = Theme.PrefKeys[Math.Max(0, cmbTheme.SelectedIndex)];
             cfg.Tiers = tiers.ToList();
         }
@@ -2127,6 +2397,29 @@ namespace HeartRatePresence
                     // the copy that just installed us is still closing
                     try { created = mutex.WaitOne(10000); } catch (AbandonedMutexException) { created = true; }
                 }
+                if (!created && !Setup.IsInstalledCopy && Setup.IsInstalled && !minimized)
+                {
+                    // A newer download was opened while the installed copy is running: offer to swap it.
+                    if (MessageBox.Show("Heart Rate Presence is running. Close it and install this version (" + AppInfo.Version + ")?",
+                            AppInfo.Name, MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                    {
+                        int me = Process.GetCurrentProcess().Id;
+                        foreach (var p in Process.GetProcessesByName("HeartRatePresence"))
+                        {
+                            try
+                            {
+                                if (p.Id != me && string.Equals(Path.GetFullPath(p.MainModule.FileName), Path.GetFullPath(AppInfo.InstalledExe), StringComparison.OrdinalIgnoreCase))
+                                {
+                                    p.Kill();
+                                    p.WaitForExit(5000);
+                                }
+                            }
+                            catch { }
+                        }
+                        try { created = mutex.WaitOne(5000); } catch (AbandonedMutexException) { created = true; }
+                    }
+                    else return 0;
+                }
                 if (!created)
                 {
                     if (!minimized) MessageBox.Show("Heart Rate Presence is already running (look for the heart in the system tray).", AppInfo.Name);
@@ -2200,6 +2493,12 @@ namespace HeartRatePresence
             var json = new JavaScriptSerializer().Serialize(a);
             log.AppendLine("activity@131: " + json);
             check(json.Contains(" 131 BPM\",\"state\"") && json.Contains("hr_high") && json.Contains("heart going brrr"), "activity text for 131");
+
+            // what the profile shows while the watch is disconnected
+            var ns = new JavaScriptSerializer().Serialize(Presence.BuildNoSignal(cfg, 1700000000));
+            log.AppendLine("no-signal activity: " + ns);
+            check(ns.Contains("heart rate paused") && ns.Contains("hr_resting") && ns.Contains("1700000000"), "no-signal activity");
+            check(!cfg.HideWhenNoSignal, "status stays up through drop-outs by default");
 
             // HTTP body parsing
             check(Engine.ParseHttpBpm("/?bpm=88", "") == 88, "GET ?bpm=88");
