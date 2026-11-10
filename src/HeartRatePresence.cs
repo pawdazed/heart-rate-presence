@@ -69,6 +69,7 @@ namespace HeartRatePresence
         public int StaleTimeoutSec { get; set; }
         public bool AutoStart { get; set; }
         public bool MinimizeToTray { get; set; }
+        public bool NoAutoUpdate { get; set; }      // false (the default, also for older config files) = update automatically
         public string Theme { get; set; }           // "System", "Light" or "Dark"
         public string Button1Label { get; set; }
         public string Button1Url { get; set; }
@@ -1568,7 +1569,12 @@ namespace HeartRatePresence
         CheckBox chkElapsed, chkAutoStart, chkTray, chkShowToken;
         Label lblHttpUrls;
         NotifyIcon tray;
-        System.Windows.Forms.Timer uiTimer;
+        System.Windows.Forms.Timer uiTimer, updateTimer;
+        public static bool NoAutoStart;             // set when relaunching after an update while stopped
+        CheckBox chkAutoUpdate;
+        Label lblUpdate;
+        Button btnUpdate;
+        bool updating, notifiedOfUpdate;
 
         int S(int px) { return (int)Math.Round(px * DeviceDpi / 96.0); }
 
@@ -1595,7 +1601,14 @@ namespace HeartRatePresence
             if (startupDone) return;
             startupDone = true;
             RefreshLive();
-            if (cfg.AutoStart && !engine.Running) ToggleRun();
+            if (cfg.AutoStart && !NoAutoStart && !engine.Running) ToggleRun();
+            updateTimer = new System.Windows.Forms.Timer { Interval = 20000 };
+            updateTimer.Tick += (s, e) =>
+            {
+                updateTimer.Interval = 6 * 60 * 60 * 1000; // first check 20 s after start, then every 6 hours
+                var _ = CheckForUpdates(false);
+            };
+            updateTimer.Start();
         }
 
         public MainForm(AppConfig config, string loadWarning, bool hidden = false)
@@ -1675,6 +1688,76 @@ namespace HeartRatePresence
         }
 
         bool quitting;
+
+        void SetUpdateText(string text)
+        {
+            if (lblUpdate != null && !lblUpdate.IsDisposed) lblUpdate.Text = text;
+        }
+
+        /// <summary>
+        /// Asks GitHub for a newer version. When one exists it is downloaded, verified and swapped in,
+        /// and the app restarts itself (unless the user turned automatic updates off).
+        /// </summary>
+        async Task CheckForUpdates(bool manual)
+        {
+            if (updating || IsDisposed) return;
+            updating = true;
+            if (manual) btnUpdate.Enabled = false;
+            try
+            {
+                SetUpdateText("Checking…");
+                var info = await Task.Run(() => Updater.Check());
+                if (!info.Newer) { SetUpdateText("You're up to date (version " + AppInfo.Version + ")"); return; }
+
+                string latest = info.Tag.TrimStart('v', 'V');
+                if (!Setup.IsInstalledCopy)
+                {
+                    SetUpdateText("Version " + latest + " is available. Open the new download to install it.");
+                    return;
+                }
+                if (cfg.NoAutoUpdate && !manual)
+                {
+                    SetUpdateText("Version " + latest + " is available. Click Check for updates to install it.");
+                    if (!notifiedOfUpdate)
+                    {
+                        notifiedOfUpdate = true;
+                        tray.ShowBalloonTip(4000, AppInfo.Name, "Version " + latest + " is available.", ToolTipIcon.Info);
+                    }
+                    return;
+                }
+                if (manual && MessageBox.Show(this, "Version " + latest + " is available (you have " + AppInfo.Version + ").\n\nInstall it now? The app restarts and reconnects by itself.",
+                        Text, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                {
+                    SetUpdateText("Version " + latest + " is available.");
+                    return;
+                }
+
+                SetUpdateText("Downloading version " + latest + "…");
+                string file = await Task.Run(() => Updater.Download(info, AppInfo.InstallDir));
+                if (IsDisposed) return;
+
+                // restart the way the user left things: hidden stays hidden, stopped stays stopped
+                bool wasRunning = engine.Running;
+                bool hidden = !Visible;
+                if (dirty) SaveAll(false);
+                SetUpdateText("Installing version " + latest + "…");
+                Updater.Swap(file, AppInfo.InstalledExe);
+                Process.Start(AppInfo.InstalledExe, "--after-setup" + (hidden ? " --minimized" : "") + (wasRunning ? "" : " --no-autostart"));
+                quitting = true;
+                dirty = false;
+                Close();
+            }
+            catch (Exception ex)
+            {
+                SetUpdateText("Couldn't update: " + ex.Message + ".");
+                if (manual) MessageBox.Show(this, "Couldn't update: " + ex.Message + ".", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            finally
+            {
+                updating = false;
+                if (manual && !IsDisposed) btnUpdate.Enabled = true;
+            }
+        }
 
         void UpdatePairUi()
         {
@@ -2128,6 +2211,12 @@ namespace HeartRatePresence
                 catch (Exception ex) { MessageBox.Show(this, "Couldn't change the startup setting: " + ex.Message, Text); }
             };
             Row("", chkStartup, null);
+            chkAutoUpdate = new CheckBox { Text = "Install updates automatically", AutoSize = true };
+            Row("", chkAutoUpdate, null);
+            btnUpdate = new Button { Text = "Check for updates", AutoSize = true, Margin = new Padding(0, S(3), 0, S(3)) };
+            btnUpdate.Click += async (s, e) => await CheckForUpdates(true);
+            lblUpdate = new Label { AutoSize = true, Tag = "muted", Margin = new Padding(S(6), S(8), 0, 0), Text = "Version " + AppInfo.Version };
+            Row("Updates", btnUpdate, lblUpdate);
             var appButtons = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, S(6), 0, 0) };
             appButtons.Controls.Add(LinkButton("Updates and help (GitHub)", AppInfo.RepoUrl));
             var uninstall = new Button { Text = "Uninstall…", AutoSize = true, Margin = new Padding(S(6), S(1), 0, S(1)) };
@@ -2227,6 +2316,7 @@ namespace HeartRatePresence
             txtB2L.Text = cfg.Button2Label; txtB2U.Text = cfg.Button2Url;
             chkAutoStart.Checked = cfg.AutoStart;
             chkTray.Checked = cfg.MinimizeToTray;
+            chkAutoUpdate.Checked = !cfg.NoAutoUpdate;
             chkKeepUp.Checked = !cfg.HideWhenNoSignal;
             txtNoSignal.Text = cfg.NoSignalText;
             txtNoSignal.Enabled = chkKeepUp.Checked;
@@ -2254,6 +2344,7 @@ namespace HeartRatePresence
             cfg.Button2Label = txtB2L.Text; cfg.Button2Url = txtB2U.Text;
             cfg.AutoStart = chkAutoStart.Checked;
             cfg.MinimizeToTray = chkTray.Checked;
+            cfg.NoAutoUpdate = !chkAutoUpdate.Checked;
             cfg.HideWhenNoSignal = !chkKeepUp.Checked;
             cfg.NoSignalText = txtNoSignal.Text;
             cfg.Theme = Theme.PrefKeys[Math.Max(0, cmbTheme.SelectedIndex)];
@@ -2344,6 +2435,16 @@ namespace HeartRatePresence
                     DrawToBitmap(b, new Rectangle(0, 0, Width, Height));
                     b.Save(Path.Combine(dir, "tab" + i + suffix + ".png"), ImageFormat.Png);
                 }
+                if (pages[i].AutoScroll)
+                {
+                    pages[i].AutoScrollPosition = new Point(0, 100000);
+                    Application.DoEvents();
+                    using (var b = new Bitmap(Width, Height))
+                    {
+                        DrawToBitmap(b, new Rectangle(0, 0, Width, Height));
+                        b.Save(Path.Combine(dir, "tab" + i + "-bottom" + suffix + ".png"), ImageFormat.Png);
+                    }
+                }
             }
             quitting = true;
             dirty = false;
@@ -2365,6 +2466,7 @@ namespace HeartRatePresence
             if (args.Length >= 2 && args[0] == "--export-art") { Art.ExportAll(args[1]); return 0; }
             if (args.Length >= 2 && args[0] == "--export-ico") { Art.WriteIco(args[1]); return 0; }
             if (args.Length >= 2 && args[0] == "--selftest") return SelfTest.Run(args[1]);
+            if (args.Length >= 2 && args[0] == "--selftest-swap") return SelfTest.RunningSwap(args[1]);
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
@@ -2400,6 +2502,7 @@ namespace HeartRatePresence
 
             bool minimized = args.Contains("--minimized");
             bool afterSetup = args.Contains("--after-setup");
+            MainForm.NoAutoStart = args.Contains("--no-autostart");
             bool created;
             using (var mutex = new Mutex(true, "HeartRatePresence_SingleInstance", out created))
             {
@@ -2437,6 +2540,7 @@ namespace HeartRatePresence
                     return 0;
                 }
 
+                if (Setup.IsInstalledCopy) Updater.CleanOld(AppInfo.InstallDir);
                 bool firstRun = !AppConfig.Exists;
                 if (!Setup.IsInstalledCopy && (firstRun || Setup.IsInstalled))
                 {
@@ -2488,6 +2592,24 @@ namespace HeartRatePresence
 
     static class SelfTest
     {
+        /// <summary>Run from a throwaway copy: swaps a new file in for the running exe itself, as the updater does.</summary>
+        public static int RunningSwap(string outFile)
+        {
+            string me = Path.GetFullPath(Application.ExecutablePath);
+            string dir = Path.GetDirectoryName(me);
+            string fresh = Path.Combine(dir, "HeartRatePresence.new");
+            File.WriteAllText(fresh, "MZ-swapped-in");
+            string result;
+            try
+            {
+                Updater.Swap(fresh, me);
+                result = (File.ReadAllText(me) == "MZ-swapped-in" && File.Exists(me + ".old") && !File.Exists(fresh)) ? "SWAP OK" : "SWAP WRONG";
+            }
+            catch (Exception ex) { result = "SWAP FAILED: " + ex.Message; }
+            File.WriteAllText(outFile, result);
+            return result == "SWAP OK" ? 0 : 1;
+        }
+
         public static int Run(string outFile)
         {
             var log = new StringBuilder();
@@ -2510,6 +2632,38 @@ namespace HeartRatePresence
             log.AppendLine("no-signal activity: " + ns);
             check(ns.Contains("heart rate paused") && ns.Contains("hr_resting") && ns.Contains("1700000000"), "no-signal activity");
             check(!cfg.HideWhenNoSignal, "status stays up through drop-outs by default");
+
+            // updater: version comparison
+            check(Updater.IsNewer("v1.2.0", "1.1.1"), "1.2.0 is newer than 1.1.1");
+            check(Updater.IsNewer("v1.10.0", "1.9.0"), "1.10.0 is newer than 1.9.0");
+            check(!Updater.IsNewer("v1.1.1", "1.1.1"), "same version is not newer");
+            check(!Updater.IsNewer("v1.0.0", "1.1.1"), "older version is not newer");
+            check(!Updater.IsNewer("garbage", "1.1.1"), "unparseable tag is ignored");
+
+            // updater: ask GitHub, download the real release file and verify it against GitHub's checksum
+            try
+            {
+                var upd = Updater.Check();
+                log.AppendLine("updater: latest release " + upd.Tag + ", " + upd.Size + " bytes, checksum " + (upd.Sha256 != null ? "published" : "MISSING") + ", newer than this build: " + upd.Newer);
+                string tmp = Path.Combine(Path.GetTempPath(), "hrp-selftest-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+                try
+                {
+                    var file = Updater.Download(upd, tmp);
+                    check(new FileInfo(file).Length == upd.Size, "updater downloaded and verified " + upd.Tag);
+                    // tampering must be caught
+                    var bad = new Updater.Info { Tag = upd.Tag, Url = upd.Url, Size = upd.Size, Sha256 = new string('0', 64) };
+                    bool caught = false;
+                    try { Updater.Download(bad, tmp); } catch (Exception ex) { caught = ex.Message.Contains("checksum"); }
+                    check(caught, "updater rejects a download with the wrong checksum");
+                    // and it only ever downloads from this repo's releases
+                    var foreign = new Updater.Info { Tag = "v9.9.9", Url = "https://example.com/HeartRatePresence.exe", Size = 1 };
+                    caught = false;
+                    try { Updater.Download(foreign, tmp); } catch (Exception ex) { caught = ex.Message.Contains("address"); }
+                    check(caught, "updater refuses downloads from other addresses");
+                }
+                finally { try { Directory.Delete(tmp, true); } catch { } }
+            }
+            catch (Exception ex) { log.AppendLine("updater: could not reach GitHub from here (" + ex.Message + "); skipped the download checks"); }
 
             // HTTP body parsing
             check(Engine.ParseHttpBpm("/?bpm=88", "") == 88, "GET ?bpm=88");

@@ -74,7 +74,10 @@ Everyone using the built-in Discord app shows the same name after "Playing". To 
 * **"Looking for a Bluetooth heart rate monitor" forever:** bring HeartCast to the front **on your iPhone**. iPhones hide the
   heart-rate signal from Windows while the app is in the background, unless you've paired (see above). Once it's connected, it keeps going in the background.
   Still nothing? Type part of the device's name (for example `HeartCast`) into Settings → Bluetooth device name.
-* **Updating:** download the new `HeartRatePresence.exe` and open it. It offers to close the running copy and updates it in place. Your settings are kept.
+* **Updating:** automatic. About 20 seconds after it starts, and every 6 hours after that, the app asks GitHub for a newer release.
+  If there is one, it downloads it, checks it against the SHA-256 checksum GitHub publishes for the file, swaps itself in place and restarts
+  (hidden stays hidden, stopped stays stopped). Your settings are kept. Settings → App lets you turn automatic updates off, or press **Check for updates**.
+  Versions before 1.2.0 don't have this: download the newest `HeartRatePresence.exe` once and open it, and it updates the installed copy.
 * **Nothing shows on Discord:** in Discord, go to User Settings → Activity Privacy and turn on "Share my activity". Also make sure you're not set to Invisible.
 * **The number lags a bit:** Discord allows about one status update every 4 seconds.
 * **Other heart rate sources:** Settings → Source also supports HypeRate (free API key, which takes a couple of days), Pulsoid (paid BRO plan),
