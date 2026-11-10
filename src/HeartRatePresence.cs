@@ -23,6 +23,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
+using Microsoft.Win32;
 using Windows.Devices.Bluetooth;
 using Windows.Devices.Bluetooth.Advertisement;
 using Windows.Devices.Bluetooth.GenericAttributeProfile;
@@ -64,6 +65,7 @@ namespace HeartRatePresence
         public int StaleTimeoutSec { get; set; }
         public bool AutoStart { get; set; }
         public bool MinimizeToTray { get; set; }
+        public string Theme { get; set; }           // "System", "Light" or "Dark"
         public string Button1Label { get; set; }
         public string Button1Url { get; set; }
         public string Button2Label { get; set; }
@@ -99,6 +101,7 @@ namespace HeartRatePresence
             c.StaleTimeoutSec = 30;
             c.AutoStart = true;
             c.MinimizeToTray = true;
+            c.Theme = "System";
             c.Button1Label = ""; c.Button1Url = "";
             c.Button2Label = ""; c.Button2Url = "";
             c.Tiers = DefaultTiers();
@@ -138,6 +141,7 @@ namespace HeartRatePresence
                 if (c.DiscordClientId == null) c.DiscordClientId = "";
                 if (c.Source != "LocalHttp" && c.Source != "Pulsoid" && c.Source != "HypeRate") c.Source = "Bluetooth";
                 if (c.BleNameFilter == null) c.BleNameFilter = "";
+                if (c.Theme != "Light" && c.Theme != "Dark") c.Theme = "System";
                 if (c.HypeRateKey == null) c.HypeRateKey = "";
                 if (c.HypeRateId == null) c.HypeRateId = "";
                 if (c.PulsoidToken == null) c.PulsoidToken = "";
@@ -1279,8 +1283,12 @@ namespace HeartRatePresence
             float s = DeviceDpi / 96f;
             var card = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
             using (var p = Round(card, 10 * s))
-            using (var bg = new SolidBrush(Color.FromArgb(0x23, 0x24, 0x28)))
+            using (var bg = new SolidBrush(Theme.Current.Card))
+            using (var border = new Pen(Theme.Current.CardBorder))
+            {
                 g.FillPath(bg, p);
+                g.DrawPath(border, p);
+            }
 
             int pad = (int)(14 * s);
             var gray = Color.FromArgb(0xB5, 0xBA, 0xC1);
@@ -1346,7 +1354,11 @@ namespace HeartRatePresence
         bool dirty;
         DateTime previewStart = DateTime.UtcNow;
 
-        TabControl tabs;
+        readonly List<Page> pages = new List<Page>();
+        Panel host, bottom;
+        NavBar nav;
+        ContextMenuStrip trayMenu;
+        ComboBox cmbTheme;
         HeartView heart;
         PreviewCard preview;
         Label lblTier, lblSource, lblDiscord, lblTestVal, lblSaved;
@@ -1409,29 +1421,38 @@ namespace HeartRatePresence
             MinimumSize = new Size(S(640), S(480));
             StartPosition = FormStartPosition.CenterScreen;
 
-            tabs = new TabControl { Dock = DockStyle.Fill, Padding = new Point(S(14), S(5)) };
-            tabs.TabPages.Add(BuildLiveTab());
-            tabs.TabPages.Add(BuildRangesTab());
-            tabs.TabPages.Add(BuildSettingsTab());
+            host = new Panel { Dock = DockStyle.Fill };
+            nav = new NavBar { Dock = DockStyle.Top, Height = S(42) };
+            foreach (var p in new[] { BuildLiveTab(), BuildRangesTab(), BuildSettingsTab() })
+            {
+                pages.Add(p);
+                host.Controls.Add(p);
+                nav.Add(p.Text);
+            }
+            nav.SelectedChanged += SelectPage;
+            SelectPage(0);
 
-            var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, FlowDirection = FlowDirection.RightToLeft, AutoSize = true, Padding = new Padding(S(8)) };
+            var bottomFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, AutoSize = true, Padding = new Padding(S(8)) };
             btnSave = new Button { Text = "Save", AutoSize = true, Padding = new Padding(S(10), S(2), S(10), S(2)) };
             btnSave.Click += (s, e) => SaveAll(true);
-            lblSaved = new Label { AutoSize = true, Margin = new Padding(S(4), S(9), S(10), 0), ForeColor = Color.DimGray };
-            bottom.Controls.Add(btnSave);
-            bottom.Controls.Add(lblSaved);
+            lblSaved = new Label { AutoSize = true, Margin = new Padding(S(4), S(9), S(10), 0) };
+            bottomFlow.Controls.Add(btnSave);
+            bottomFlow.Controls.Add(lblSaved);
+            bottom = new Panel { Dock = DockStyle.Bottom, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink };
+            bottom.Controls.Add(bottomFlow);
 
             Controls.Add(bottom);
-            Controls.Add(tabs);
-            tabs.BringToFront();
+            Controls.Add(nav);
+            Controls.Add(host);
+            host.BringToFront();
             AcceptButton = null;
 
             tray = new NotifyIcon { Icon = Icon, Text = "Heart Rate Presence", Visible = true };
-            var menu = new ContextMenuStrip();
-            menu.Items.Add("Open", null, (s, e) => RestoreFromTray());
-            menu.Items.Add("Start / Stop", null, (s, e) => ToggleRun());
-            menu.Items.Add("Quit", null, (s, e) => { quitting = true; Close(); });
-            tray.ContextMenuStrip = menu;
+            trayMenu = new ContextMenuStrip { ShowImageMargin = false };
+            trayMenu.Items.Add("Open", null, (s, e) => RestoreFromTray());
+            trayMenu.Items.Add("Start / Stop", null, (s, e) => ToggleRun());
+            trayMenu.Items.Add("Quit", null, (s, e) => { quitting = true; Close(); });
+            tray.ContextMenuStrip = trayMenu;
             tray.DoubleClick += (s, e) => RestoreFromTray();
 
             LoadIntoUi();
@@ -1439,15 +1460,20 @@ namespace HeartRatePresence
             savedSnapshot = Snapshot();
             loading = false;
             dirty = false;
+            ApplyTheme();
             UpdateSavedLabel();
             if (loadWarning != null) lblSaved.Text = loadWarning;
+
+            HandleCreated += (s, e) => Theme.TitleBar(this, Theme.Current.Dark);
+            SystemEvents.UserPreferenceChanged += OnWindowsThemeChanged;
 
             uiTimer = new System.Windows.Forms.Timer { Interval = 33 };
             int frame = 0;
             uiTimer.Tick += (s, e) => { heart.Tick(); if (++frame % 6 == 0) RefreshLive(); };
             uiTimer.Start();
 
-            Shown += (s, e) => StartupActions();
+            Shown += (s, e) => { ApplyTheme(); StartupActions(); };
+            VisibleChanged += (s, e) => { if (Visible && startupDone) Theme.Apply(this, Theme.Current); };
             Resize += (s, e) =>
             {
                 if (WindowState == FormWindowState.Minimized && chkTray.Checked)
@@ -1460,6 +1486,44 @@ namespace HeartRatePresence
 
         bool quitting;
 
+        void SelectPage(int i)
+        {
+            for (int k = 0; k < pages.Count; k++) pages[k].Visible = k == i;
+            nav.SelectedIndex = i;
+            // controls on a page get their window handles when first shown; give those the native dark styles
+            if (!loading) Theme.Apply(pages[i], Theme.Current);
+        }
+
+        string ThemePref()
+        {
+            return cmbTheme != null && cmbTheme.SelectedIndex >= 0 ? Theme.PrefKeys[cmbTheme.SelectedIndex] : (cfg.Theme ?? "System");
+        }
+
+        void ApplyTheme()
+        {
+            var t = Theme.Resolve(ThemePref());
+            Theme.Current = t;
+            SuspendLayout();
+            BackColor = t.Bg;
+            ForeColor = t.Text;
+            bottom.BackColor = t.Alt;
+            Theme.Apply(this, t);
+            trayMenu.Renderer = new ThemedMenuRenderer(t);
+            trayMenu.BackColor = t.Alt;
+            trayMenu.ForeColor = t.Text;
+            ResumeLayout(true);
+            Theme.TitleBar(this, t.Dark);
+            UpdateSavedLabel();
+            if (!loading) RefreshLive();
+            Invalidate(true);
+        }
+
+        void OnWindowsThemeChanged(object sender, UserPreferenceChangedEventArgs e)
+        {
+            if (e.Category != UserPreferenceCategory.General || ThemePref() != "System" || !IsHandleCreated) return;
+            try { BeginInvoke(new Action(ApplyTheme)); } catch { }
+        }
+
         void RestoreFromTray()
         {
             Show();
@@ -1469,9 +1533,9 @@ namespace HeartRatePresence
 
         // ---------------- Live tab
 
-        TabPage BuildLiveTab()
+        Page BuildLiveTab()
         {
-            var page = new TabPage("Live") { Padding = new Padding(S(10)), UseVisualStyleBackColor = false, BackColor = Color.White };
+            var page = new Page("Live") { Padding = new Padding(S(10)) };
             var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2 };
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, S(250)));
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -1481,7 +1545,7 @@ namespace HeartRatePresence
             var left = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1 };
             left.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             left.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            heart = new HeartView { Dock = DockStyle.Fill, BackColor = Color.White };
+            heart = new HeartView { Dock = DockStyle.Fill };
             lblTier = new Label { Dock = DockStyle.Fill, AutoSize = true, TextAlign = ContentAlignment.MiddleCenter, Font = new Font("Segoe UI", 11f, FontStyle.Bold), Padding = new Padding(0, S(4), 0, S(4)) };
             left.Controls.Add(heart, 0, 0);
             left.Controls.Add(lblTier, 0, 1);
@@ -1573,7 +1637,7 @@ namespace HeartRatePresence
             else
             {
                 lblTier.Text = engine.Running ? "waiting for heart rate…" : "not running";
-                lblTier.ForeColor = Color.Gray;
+                lblTier.ForeColor = Theme.Current.Muted;
             }
 
             preview.Empty = r == null;
@@ -1605,9 +1669,9 @@ namespace HeartRatePresence
 
         // ---------------- Ranges tab
 
-        TabPage BuildRangesTab()
+        Page BuildRangesTab()
         {
-            var page = new TabPage("BPM ranges") { Padding = new Padding(S(10)), UseVisualStyleBackColor = true };
+            var page = new Page("BPM ranges") { Padding = new Padding(S(10)) };
             var help = new Label
             {
                 Dock = DockStyle.Top, AutoSize = true, MaximumSize = new Size(S(740), 0), Padding = new Padding(0, 0, 0, S(8)),
@@ -1619,7 +1683,7 @@ namespace HeartRatePresence
             grid = new DataGridView
             {
                 Dock = DockStyle.Fill, AutoGenerateColumns = false, AllowUserToAddRows = false, RowHeadersVisible = false,
-                SelectionMode = DataGridViewSelectionMode.CellSelect, BackgroundColor = SystemColors.Window, BorderStyle = BorderStyle.FixedSingle,
+                SelectionMode = DataGridViewSelectionMode.CellSelect, BorderStyle = BorderStyle.FixedSingle,
                 ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
             };
             grid.RowTemplate.Height = S(26);
@@ -1631,6 +1695,11 @@ namespace HeartRatePresence
             AddCol("LargeText", "Image hover text", 110);
             AddCol("SmallImage", "Small image", 75);
             AddCol("SmallText", "Small hover text", 90);
+            grid.EditingControlShowing += (s, e) =>
+            {
+                e.Control.BackColor = Theme.Current.Surface;
+                e.Control.ForeColor = Theme.Current.Text;
+            };
             grid.DataError += (s, e) => { e.ThrowException = false; MessageBox.Show(this, "Min BPM must be a whole number.", Text); };
             grid.CellValueChanged += (s, e) => MarkDirty();
             grid.RowsRemoved += (s, e) => MarkDirty();
@@ -1702,9 +1771,9 @@ namespace HeartRatePresence
 
         TableLayoutPanel form;
 
-        TabPage BuildSettingsTab()
+        Page BuildSettingsTab()
         {
-            var page = new TabPage("Settings") { Padding = new Padding(S(10)), UseVisualStyleBackColor = true, AutoScroll = true };
+            var page = new Page("Settings") { Padding = new Padding(S(10)), AutoScroll = true };
             form = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 3 };
             form.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             form.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -1754,7 +1823,7 @@ namespace HeartRatePresence
             tokRow.Controls.Add(LinkButton("Get token", "https://pulsoid.net/ui/keys"));
             Row("Pulsoid token", txtToken, tokRow);
             numPort = Num(1024, 65535);
-            lblHttpUrls = new Label { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(S(6), S(6), 0, 0) };
+            lblHttpUrls = new Label { AutoSize = true, Tag = "muted", Margin = new Padding(S(6), S(6), 0, 0) };
             Row("Local HTTP port", numPort, lblHttpUrls);
             numPort.ValueChanged += (s, e) => UpdateHttpHint();
             cmbSource.SelectedIndexChanged += (s, e) => UpdateSourceEnabled();
@@ -1766,6 +1835,11 @@ namespace HeartRatePresence
             Row("Button 2 label", txtB2L, null); Row("Button 2 link", txtB2U, null);
 
             Section("App");
+            cmbTheme = Combo(Theme.PrefNames);
+            cmbTheme.Dock = DockStyle.None;
+            cmbTheme.Width = S(180);
+            cmbTheme.SelectedIndexChanged += (s, e) => { if (!loading) ApplyTheme(); };
+            Row("Theme", cmbTheme, null);
             chkAutoStart = new CheckBox { Text = "Start sending as soon as the app opens", AutoSize = true };
             chkTray = new CheckBox { Text = "Minimizing hides the app in the system tray", AutoSize = true };
             Row("", chkAutoStart, null);
@@ -1830,7 +1904,7 @@ namespace HeartRatePresence
             return b;
         }
 
-        Label Hint(string text) { return new Label { Text = text, AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(S(6), S(6), 0, 0) }; }
+        Label Hint(string text) { return new Label { Text = text, AutoSize = true, Tag = "muted", Margin = new Padding(S(6), S(6), 0, 0) }; }
 
         ComboBox Combo(string[] items)
         {
@@ -1877,6 +1951,7 @@ namespace HeartRatePresence
             txtB2L.Text = cfg.Button2Label; txtB2U.Text = cfg.Button2Url;
             chkAutoStart.Checked = cfg.AutoStart;
             chkTray.Checked = cfg.MinimizeToTray;
+            cmbTheme.SelectedIndex = Math.Max(0, Array.IndexOf(Theme.PrefKeys, cfg.Theme));
             SetTiers(cfg.Tiers.Select(t => t).ToList());
             UpdateSourceEnabled();
         }
@@ -1900,6 +1975,7 @@ namespace HeartRatePresence
             cfg.Button2Label = txtB2L.Text; cfg.Button2Url = txtB2U.Text;
             cfg.AutoStart = chkAutoStart.Checked;
             cfg.MinimizeToTray = chkTray.Checked;
+            cfg.Theme = Theme.PrefKeys[Math.Max(0, cmbTheme.SelectedIndex)];
             cfg.Tiers = tiers.ToList();
         }
 
@@ -1927,7 +2003,7 @@ namespace HeartRatePresence
         {
             if (lblSaved == null) return;
             lblSaved.Text = dirty ? "Unsaved changes" : "";
-            lblSaved.ForeColor = dirty ? Color.DarkOrange : Color.DimGray;
+            lblSaved.ForeColor = dirty ? Color.FromArgb(0xF0, 0xA0, 0x30) : Theme.Current.Muted;
         }
 
         void SaveAll(bool restartIfNeeded)
@@ -1963,17 +2039,21 @@ namespace HeartRatePresence
             }
             engine.Stop();
             tray.Visible = false;
+            SystemEvents.UserPreferenceChanged -= OnWindowsThemeChanged;
             base.OnFormClosing(e);
         }
 
         // used by --screenshot to render each tab without showing on screen
-        public void CaptureTabs(string dir, int testBpm)
+        public void CaptureTabs(string dir, int testBpm, string themePref)
         {
             chkTest.Checked = true;
             trkTest.Value = testBpm;
-            for (int i = 0; i < tabs.TabCount; i++)
+            int ti = Array.IndexOf(Theme.PrefKeys, themePref ?? "");
+            if (ti >= 0) cmbTheme.SelectedIndex = ti;
+            string suffix = ti >= 0 ? "-" + themePref.ToLowerInvariant() : "";
+            for (int i = 0; i < pages.Count; i++)
             {
-                tabs.SelectedIndex = i;
+                SelectPage(i);
                 Application.DoEvents();
                 RefreshLive();
                 heart.Tick();
@@ -1981,9 +2061,11 @@ namespace HeartRatePresence
                 using (var b = new Bitmap(Width, Height))
                 {
                     DrawToBitmap(b, new Rectangle(0, 0, Width, Height));
-                    b.Save(Path.Combine(dir, "tab" + i + ".png"), ImageFormat.Png);
+                    b.Save(Path.Combine(dir, "tab" + i + suffix + ".png"), ImageFormat.Png);
                 }
             }
+            quitting = true;
+            dirty = false;
         }
     }
 
@@ -2008,6 +2090,7 @@ namespace HeartRatePresence
 
             if (args.Length >= 2 && args[0] == "--screenshot-welcome")
             {
+                if (args.Length >= 3) WelcomeForm.ForcedTheme = args[2];
                 using (var wf = new WelcomeForm { StartPosition = FormStartPosition.Manual, Location = new Point(-4000, -4000), ShowInTaskbar = false })
                 {
                     wf.Show();
@@ -2015,7 +2098,7 @@ namespace HeartRatePresence
                     using (var b = new Bitmap(wf.Width, wf.Height))
                     {
                         wf.DrawToBitmap(b, new Rectangle(0, 0, wf.Width, wf.Height));
-                        b.Save(Path.Combine(args[1], "welcome.png"), ImageFormat.Png);
+                        b.Save(Path.Combine(args[1], "welcome" + (args.Length >= 3 ? "-" + args[2].ToLowerInvariant() : "") + ".png"), ImageFormat.Png);
                     }
                 }
                 return 0;
@@ -2024,10 +2107,12 @@ namespace HeartRatePresence
             if (args.Length >= 2 && args[0] == "--screenshot")
             {
                 string w;
-                var f = new MainForm(AppConfig.Load(out w), null) { StartPosition = FormStartPosition.Manual, Location = new Point(-4000, -4000), ShowInTaskbar = false };
+                var shotCfg = AppConfig.Load(out w);
+                shotCfg.AutoStart = false; // screenshots must never touch the real Discord status
+                var f = new MainForm(shotCfg, null) { StartPosition = FormStartPosition.Manual, Location = new Point(-4000, -4000), ShowInTaskbar = false };
                 f.Show();
                 Application.DoEvents();
-                f.CaptureTabs(args[1], args.Length >= 3 ? int.Parse(args[2]) : 128);
+                f.CaptureTabs(args[1], args.Length >= 3 ? int.Parse(args[2]) : 128, args.Length >= 4 ? args[3] : null);
                 f.Close();
                 return 0;
             }

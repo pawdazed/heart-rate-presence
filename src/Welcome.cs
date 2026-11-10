@@ -26,7 +26,6 @@ namespace HeartRatePresence
             StartPosition = FormStartPosition.CenterScreen;
             AutoSize = true;
             AutoSizeMode = AutoSizeMode.GrowAndShrink;
-            BackColor = Color.White;
             Padding = new Padding(S(20));
 
             var root = new TableLayoutPanel { AutoSize = true, ColumnCount = 2, Dock = DockStyle.Fill };
@@ -67,6 +66,20 @@ namespace HeartRatePresence
             Controls.Add(root);
             AcceptButton = ok;
             CancelButton = cancel;
+
+            // No settings exist yet on first run, so follow Windows' light/dark choice.
+            var t = Theme.Resolve(ForcedTheme ?? "System");
+            Theme.Current = t;
+            BackColor = t.Bg;
+            ForeColor = t.Text;
+            Theme.Apply(this, t);
+            ok.BackColor = t.Accent; ok.ForeColor = Color.White;
+            ok.FlatAppearance.BorderColor = t.Accent;
+            ok.FlatAppearance.MouseOverBackColor = ControlPaint.Light(t.Accent, 0.1f);
+            HandleCreated += (s, e) => Theme.TitleBar(this, t.Dark);
         }
+
+        /// <summary>Only used for screenshots.</summary>
+        public static string ForcedTheme;
     }
 }
