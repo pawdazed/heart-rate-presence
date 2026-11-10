@@ -610,6 +610,7 @@ namespace HeartRatePresence
             var ser = new JavaScriptSerializer();
             DiscordIpc ipc = null;
             string lastKey = null;
+            bool sentTimer = false;
             DateTime lastSend = DateTime.MinValue;
             while (!ct.IsCancellationRequested)
             {
@@ -621,6 +622,7 @@ namespace HeartRatePresence
                         ipc = new DiscordIpc();
                         ipc.Connect(clientId);
                         lastKey = null;
+                        sentTimer = false;
                         SetDiscord(ct, "Connected as " + ipc.UserName + ". Waiting for heart rate…");
                     }
                     var cfg = Config;
@@ -633,7 +635,16 @@ namespace HeartRatePresence
                     string key = act == null ? "null" : ser.Serialize(act);
                     if (key != lastKey && (DateTime.UtcNow - lastSend).TotalSeconds >= Math.Max(4, cfg.UpdateIntervalSec))
                     {
+                        // Discord keeps showing the old timer if an update just leaves it out, so when the
+                        // timer is switched off, clear the activity first and then send the new one.
+                        bool hasTimer = act != null && act.ContainsKey("timestamps");
+                        if (sentTimer && !hasTimer && act != null)
+                        {
+                            ipc.SetActivity(null);
+                            ct.WaitHandle.WaitOne(1500);
+                        }
                         string err = ipc.SetActivity(act);
+                        sentTimer = hasTimer;
                         lastSend = DateTime.UtcNow;
                         lastKey = key;
                         if (err != null) SetDiscord(ct, "Discord rejected the update: " + err);
