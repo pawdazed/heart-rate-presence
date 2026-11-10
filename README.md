@@ -62,7 +62,7 @@ Open the app (Start menu → Heart Rate Presence):
   Use `{bpm}` anywhere for your live heart rate, plus `{name}`, `{min}` and `{max}`.
 * **Your own icons:** paste a direct `https://` link to any PNG or GIF (animated GIFs work). Use links that don't expire,
   like imgur or a GitHub repo. Discord attachment links stop working after a while.
-* **Settings tab:** Playing / Listening to / Watching / Competing in, what the member list shows, the elapsed timer,
+* **Settings tab:** Playing / Listening to / Watching / Competing in, what the member list shows,
   up to 2 link buttons on your profile, and start-with-Windows.
 * **Test with a fake BPM** on the Live tab lets you try your ranges without the watch.
 

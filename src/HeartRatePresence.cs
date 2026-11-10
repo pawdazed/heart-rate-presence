@@ -64,7 +64,6 @@ namespace HeartRatePresence
         public int HttpPort { get; set; }
         public int ActivityType { get; set; }       // 0 Playing, 2 Listening, 3 Watching, 5 Competing
         public int StatusDisplay { get; set; }      // 0 app name, 1 state, 2 details
-        public bool ShowElapsed { get; set; }
         public int UpdateIntervalSec { get; set; }
         public int StaleTimeoutSec { get; set; }
         public bool AutoStart { get; set; }
@@ -107,7 +106,6 @@ namespace HeartRatePresence
             c.HttpPort = 8765;
             c.ActivityType = 0;
             c.StatusDisplay = 2;
-            c.ShowElapsed = true;
             c.UpdateIntervalSec = 5;
             c.StaleTimeoutSec = 30;
             c.AutoStart = true;
@@ -611,7 +609,6 @@ namespace HeartRatePresence
             var ser = new JavaScriptSerializer();
             DiscordIpc ipc = null;
             string lastKey = null;
-            bool sentTimer = false;
             DateTime lastSend = DateTime.MinValue;
             while (!ct.IsCancellationRequested)
             {
@@ -623,14 +620,13 @@ namespace HeartRatePresence
                         ipc = new DiscordIpc();
                         ipc.Connect(clientId);
                         lastKey = null;
-                        sentTimer = false;
                         SetDiscord(ct, "Connected as " + ipc.UserName + ". Waiting for heart rate…");
                     }
                     var cfg = Config;
                     int b = CurrentBpm();
-                    // Discord always draws a music timer for "Listening to". Without a start time it restarts on every
-                    // update, so for that type always send a fixed start and let it count up steadily.
-                    long? start = (cfg.ShowElapsed || cfg.ActivityType == 2) ? (long?)ToUnix(sessionStart) : null;
+                    // Discord draws a timer whether or not we send a start time, and without one it restarts on
+                    // every update. Always send a fixed start so it counts up steadily instead.
+                    long? start = ToUnix(sessionStart);
                     if (b > 0) hadData = true;
                     // Once the watch has sent anything, keep the status up through drop-outs until the user presses Stop.
                     bool noSignal = b == 0 && hadData && !cfg.HideWhenNoSignal;
@@ -638,16 +634,7 @@ namespace HeartRatePresence
                     string key = act == null ? "null" : ser.Serialize(act);
                     if (key != lastKey && (DateTime.UtcNow - lastSend).TotalSeconds >= Math.Max(4, cfg.UpdateIntervalSec))
                     {
-                        // Discord keeps showing the old timer if an update just leaves it out, so when the
-                        // timer is switched off, clear the activity first and then send the new one.
-                        bool hasTimer = act != null && act.ContainsKey("timestamps");
-                        if (sentTimer && !hasTimer && act != null)
-                        {
-                            ipc.SetActivity(null);
-                            ct.WaitHandle.WaitOne(1500);
-                        }
                         string err = ipc.SetActivity(act);
-                        sentTimer = hasTimer;
                         lastSend = DateTime.UtcNow;
                         lastKey = key;
                         if (err != null) SetDiscord(ct, "Discord rejected the update: " + err);
@@ -1568,7 +1555,7 @@ namespace HeartRatePresence
         TextBox txtClientId, txtToken, txtB1L, txtB1U, txtB2L, txtB2U;
         ComboBox cmbSource, cmbType, cmbDisplay;
         NumericUpDown numPort, numInterval, numStale;
-        CheckBox chkElapsed, chkAutoStart, chkTray, chkShowToken;
+        CheckBox chkAutoStart, chkTray, chkShowToken;
         Label lblHttpUrls;
         NotifyIcon tray;
         System.Windows.Forms.Timer uiTimer, updateTimer;
@@ -1690,17 +1677,6 @@ namespace HeartRatePresence
         }
 
         bool quitting;
-
-        /// <summary>"Listening to" always shows a timer in Discord, so say so instead of offering a switch that can't work.</summary>
-        void UpdateTimerUi()
-        {
-            if (chkElapsed == null || cmbType == null) return;
-            bool listening = cmbType.SelectedIndex >= 0 && Presence.TypeValues[cmbType.SelectedIndex] == 2;
-            chkElapsed.Text = listening
-                ? "Timer: always shown for “Listening to” (use Playing to hide)"
-                : "Show the elapsed-time timer";
-            chkElapsed.Enabled = !listening;
-        }
 
         void SetUpdateText(string text)
         {
@@ -2005,12 +1981,8 @@ namespace HeartRatePresence
                     preview.LargeImage = tiers0.Count > 0 ? tiers0[0].LargeImage : "";
                     preview.SmallImage = "";
                 }
-                if (ec.ShowElapsed || ec.ActivityType == 2)
-                {
-                    var el = DateTime.UtcNow - previewStart;
-                    preview.Elapsed = (el.TotalHours >= 1 ? ((int)el.TotalHours) + ":" : "") + el.Minutes.ToString("00") + ":" + el.Seconds.ToString("00") + " elapsed";
-                }
-                else preview.Elapsed = "";
+                var el = DateTime.UtcNow - previewStart;
+                preview.Elapsed = (el.TotalHours >= 1 ? ((int)el.TotalHours) + ":" : "") + el.Minutes.ToString("00") + ":" + el.Seconds.ToString("00") + " elapsed";
             }
             preview.Invalidate();
 
@@ -2145,9 +2117,6 @@ namespace HeartRatePresence
             Row("Activity type", cmbType, null);
             cmbDisplay = Combo(new[] { "App name (“Playing Heart Rate”)", "Line 2 (state)", "Line 1 (details, e.g. “❤ 82 BPM”)" });
             Row("Member list shows", cmbDisplay, null);
-            chkElapsed = new CheckBox { Text = "Show the elapsed-time timer", AutoSize = true };
-            cmbType.SelectedIndexChanged += (s, e) => UpdateTimerUi();
-            Row("", chkElapsed, null);
             numInterval = Num(4, 60);
             Row("Update every (seconds)", numInterval, Hint("Discord's limit: 4 s"));
             numStale = Num(5, 600);
@@ -2316,9 +2285,7 @@ namespace HeartRatePresence
             txtClientId.Text = cfg.DiscordClientId;
             int ti = Array.IndexOf(Presence.TypeValues, cfg.ActivityType);
             cmbType.SelectedIndex = ti < 0 ? 0 : ti;
-            UpdateTimerUi();
             cmbDisplay.SelectedIndex = Math.Max(0, Math.Min(2, cfg.StatusDisplay));
-            chkElapsed.Checked = cfg.ShowElapsed;
             numInterval.Value = Math.Max(4, Math.Min(60, cfg.UpdateIntervalSec));
             numStale.Value = Math.Max(5, Math.Min(600, cfg.StaleTimeoutSec));
             cmbSource.SelectedIndex = Math.Max(0, Array.IndexOf(SourceKeys, cfg.Source));
@@ -2346,7 +2313,6 @@ namespace HeartRatePresence
             cfg.DiscordClientId = txtClientId.Text.Trim();
             cfg.ActivityType = Presence.TypeValues[Math.Max(0, cmbType.SelectedIndex)];
             cfg.StatusDisplay = Math.Max(0, cmbDisplay.SelectedIndex);
-            cfg.ShowElapsed = chkElapsed.Checked;
             cfg.UpdateIntervalSec = (int)numInterval.Value;
             cfg.StaleTimeoutSec = (int)numStale.Value;
             cfg.Source = SourceKeys[Math.Max(0, cmbSource.SelectedIndex)];
