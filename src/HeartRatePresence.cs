@@ -628,7 +628,9 @@ namespace HeartRatePresence
                     }
                     var cfg = Config;
                     int b = CurrentBpm();
-                    long? start = cfg.ShowElapsed ? (long?)ToUnix(sessionStart) : null;
+                    // Discord always draws a music timer for "Listening to". Without a start time it restarts on every
+                    // update, so for that type always send a fixed start and let it count up steadily.
+                    long? start = (cfg.ShowElapsed || cfg.ActivityType == 2) ? (long?)ToUnix(sessionStart) : null;
                     if (b > 0) hadData = true;
                     // Once the watch has sent anything, keep the status up through drop-outs until the user presses Stop.
                     bool noSignal = b == 0 && hadData && !cfg.HideWhenNoSignal;
@@ -1689,6 +1691,17 @@ namespace HeartRatePresence
 
         bool quitting;
 
+        /// <summary>"Listening to" always shows a timer in Discord, so say so instead of offering a switch that can't work.</summary>
+        void UpdateTimerUi()
+        {
+            if (chkElapsed == null || cmbType == null) return;
+            bool listening = cmbType.SelectedIndex >= 0 && Presence.TypeValues[cmbType.SelectedIndex] == 2;
+            chkElapsed.Text = listening
+                ? "Timer: always shown for “Listening to” (use Playing to hide)"
+                : "Show the elapsed-time timer";
+            chkElapsed.Enabled = !listening;
+        }
+
         void SetUpdateText(string text)
         {
             if (lblUpdate != null && !lblUpdate.IsDisposed) lblUpdate.Text = text;
@@ -1992,7 +2005,7 @@ namespace HeartRatePresence
                     preview.LargeImage = tiers0.Count > 0 ? tiers0[0].LargeImage : "";
                     preview.SmallImage = "";
                 }
-                if (ec.ShowElapsed)
+                if (ec.ShowElapsed || ec.ActivityType == 2)
                 {
                     var el = DateTime.UtcNow - previewStart;
                     preview.Elapsed = (el.TotalHours >= 1 ? ((int)el.TotalHours) + ":" : "") + el.Minutes.ToString("00") + ":" + el.Seconds.ToString("00") + " elapsed";
@@ -2133,6 +2146,7 @@ namespace HeartRatePresence
             cmbDisplay = Combo(new[] { "App name (“Playing Heart Rate”)", "Line 2 (state)", "Line 1 (details, e.g. “❤ 82 BPM”)" });
             Row("Member list shows", cmbDisplay, null);
             chkElapsed = new CheckBox { Text = "Show the elapsed-time timer", AutoSize = true };
+            cmbType.SelectedIndexChanged += (s, e) => UpdateTimerUi();
             Row("", chkElapsed, null);
             numInterval = Num(4, 60);
             Row("Update every (seconds)", numInterval, Hint("Discord's limit: 4 s"));
@@ -2302,6 +2316,7 @@ namespace HeartRatePresence
             txtClientId.Text = cfg.DiscordClientId;
             int ti = Array.IndexOf(Presence.TypeValues, cfg.ActivityType);
             cmbType.SelectedIndex = ti < 0 ? 0 : ti;
+            UpdateTimerUi();
             cmbDisplay.SelectedIndex = Math.Max(0, Math.Min(2, cfg.StatusDisplay));
             chkElapsed.Checked = cfg.ShowElapsed;
             numInterval.Value = Math.Max(4, Math.Min(60, cfg.UpdateIntervalSec));

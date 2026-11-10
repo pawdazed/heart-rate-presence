@@ -21,7 +21,7 @@ namespace HeartRatePresence
         /// <summary>GitHub "owner/repo". The heart icons are served from its assets folder.</summary>
         public const string RepoSlug = "pawdazed/heart-rate-presence";
 
-        public const string Version = "1.2.0";
+        public const string Version = "1.2.1";
         public const string Name = "Heart Rate Presence";
 
         public static string RepoUrl { get { return "https://github.com/" + RepoSlug; } }
