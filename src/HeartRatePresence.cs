@@ -762,70 +762,127 @@ namespace HeartRatePresence
             filter = (filter ?? "").Trim();
             ulong lastAddr = 0;
             string lastName = null;
-            while (!ct.IsCancellationRequested)
+            // A paired phone is kept open for the whole run with MaintainConnection on, so Windows itself keeps
+            // trying to reconnect in the background (an iPhone in the background doesn't answer a fresh search).
+            BluetoothLEDevice pairedDev = null;
+            GattSession pairedSession = null;
+            string pairedId = null;
+            try
             {
-                BluetoothLEDevice dev = null;
-                string devName = null;
-                try
+                while (!ct.IsCancellationRequested)
                 {
-                    // 1) a device paired with Windows: Windows recognises it even after an iPhone
-                    //    changes its Bluetooth address, and while HeartCast is in the background.
-                    var cfg = Config;
-                    if (!string.IsNullOrEmpty(cfg.BlePairedId))
+                    BluetoothLEDevice dev = null;
+                    GattSession session = null;
+                    string devName = null;
+                    try
                     {
-                        devName = string.IsNullOrEmpty(cfg.BlePairedName) ? "your paired device" : cfg.BlePairedName;
-                        SetSource(ct, "Reconnecting to " + devName + "…");
-                        dev = await TryOpen(() => BluetoothLEDevice.FromIdAsync(cfg.BlePairedId), ct);
-                        if (dev != null && !await StreamFrom(dev, devName, ct)) { dev.Dispose(); dev = null; }
-                        else if (dev != null) { lastAddr = dev.BluetoothAddress; lastName = devName; continue; }
-                    }
+                        var cfg = Config;
+                        string wantId = cfg.BlePairedId ?? "";
+                        if (wantId != pairedId)
+                        {
+                            try { if (pairedSession != null) pairedSession.Dispose(); } catch { }
+                            try { if (pairedDev != null) pairedDev.Dispose(); } catch { }
+                            pairedSession = null; pairedDev = null; pairedId = null;
+                            if (wantId.Length > 0)
+                            {
+                                pairedDev = await TryOpen(() => BluetoothLEDevice.FromIdAsync(wantId), ct);
+                                if (pairedDev != null) { pairedSession = await Maintain(pairedDev, ct); pairedId = wantId; }
+                            }
+                        }
 
-                    // 2) the device we were connected to a moment ago (works until an iPhone rotates its address)
-                    if (lastAddr != 0)
-                    {
-                        devName = lastName;
-                        SetSource(ct, "Reconnecting to " + devName + "…");
-                        ulong a = lastAddr;
-                        dev = await TryOpen(() => BluetoothLEDevice.FromBluetoothAddressAsync(a), ct);
-                        if (dev != null && await StreamFrom(dev, devName, ct)) continue;
-                        if (dev != null) { dev.Dispose(); dev = null; }
-                    }
+                        // 1) the paired device: wait for Windows to bring the link back, then stream from it
+                        if (pairedDev != null)
+                        {
+                            devName = string.IsNullOrEmpty(cfg.BlePairedName) ? "your paired device" : cfg.BlePairedName;
+                            SetSource(ct, "Waiting for " + devName + " to connect… It reconnects by itself when it's back in range.");
+                            if (await WaitConnected(pairedDev, TimeSpan.FromSeconds(60), ct))
+                            {
+                                lastAddr = pairedDev.BluetoothAddress; lastName = devName;
+                                if (!await StreamFrom(pairedDev, devName, ct)) await Task.Delay(3000, ct);
+                                continue;
+                            }
+                        }
 
-                    // 3) scan for anything advertising heart rate
-                    bool haveFallback = !string.IsNullOrEmpty(Config.BlePairedId) || lastAddr != 0;
-                    SetSource(ct, "Looking for a Bluetooth heart rate monitor" + (filter.Length > 0 ? " named “" + filter + "”" : "") +
-                                  "… Start HeartCast on your watch and open HeartCast on your iPhone." +
-                                  (string.IsNullOrEmpty(Config.BlePairedId) ? "" : " (Your paired phone reconnects by itself once it's in range.)"));
-                    Tuple<ulong, string> found;
-                    using (var scan = CancellationTokenSource.CreateLinkedTokenSource(ct))
-                    {
-                        if (haveFallback) scan.CancelAfter(TimeSpan.FromSeconds(25));
-                        try { found = await FindHrDevice(filter, scan.Token); }
-                        catch (OperationCanceledException) { if (ct.IsCancellationRequested) break; continue; }
+                        // 2) the device we were connected to a moment ago (works until an iPhone rotates its address)
+                        if (lastAddr != 0)
+                        {
+                            devName = lastName;
+                            ulong a = lastAddr;
+                            dev = await TryOpen(() => BluetoothLEDevice.FromBluetoothAddressAsync(a), ct);
+                            if (dev != null)
+                            {
+                                session = await Maintain(dev, ct);
+                                if (await StreamFrom(dev, devName, ct)) continue;
+                                if (session != null) { session.Dispose(); session = null; }
+                                dev.Dispose(); dev = null;
+                            }
+                        }
+
+                        // 3) scan for anything advertising heart rate
+                        bool haveFallback = pairedDev != null || lastAddr != 0;
+                        SetSource(ct, "Looking for a Bluetooth heart rate monitor" + (filter.Length > 0 ? " named “" + filter + "”" : "") +
+                                      "… Start HeartCast on your watch and open HeartCast on your iPhone.");
+                        Tuple<ulong, string> found;
+                        using (var scan = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                        {
+                            if (haveFallback) scan.CancelAfter(TimeSpan.FromSeconds(25));
+                            try { found = await FindHrDevice(filter, scan.Token); }
+                            catch (OperationCanceledException) { if (ct.IsCancellationRequested) break; continue; }
+                        }
+                        devName = found.Item2;
+                        SetSource(ct, "Found " + devName + ". Connecting…");
+                        dev = await WinRt.Await(BluetoothLEDevice.FromBluetoothAddressAsync(found.Item1), ct);
+                        if (dev == null) throw new Exception("Windows couldn't open " + devName + ".");
+                        if (!string.IsNullOrEmpty(dev.Name)) devName = dev.Name;
+                        session = await Maintain(dev, ct);
+                        if (await StreamFrom(dev, devName, ct)) { lastAddr = found.Item1; lastName = devName; }
+                        else throw new Exception(devName + " didn't send heart rate.");
                     }
-                    devName = found.Item2;
-                    SetSource(ct, "Found " + devName + ". Connecting…");
-                    dev = await WinRt.Await(BluetoothLEDevice.FromBluetoothAddressAsync(found.Item1), ct);
-                    if (dev == null) throw new Exception("Windows couldn't open " + devName + ".");
-                    if (!string.IsNullOrEmpty(dev.Name)) devName = dev.Name;
-                    if (await StreamFrom(dev, devName, ct)) { lastAddr = found.Item1; lastName = devName; }
-                    else throw new Exception(devName + " didn't send heart rate.");
+                    catch (OperationCanceledException) { if (ct.IsCancellationRequested) break; }
+                    catch (Exception ex)
+                    {
+                        if (ct.IsCancellationRequested) break;
+                        SetSource(ct, "Bluetooth: " + Innermost(ex).Message + " Retrying in 3 s…");
+                        try { await Task.Delay(3000, ct); } catch { break; }
+                    }
+                    finally
+                    {
+                        try { if (session != null) session.Dispose(); } catch { }
+                        try { if (dev != null) dev.Dispose(); } catch { }
+                    }
                 }
-                catch (OperationCanceledException) { if (ct.IsCancellationRequested) break; }
-                catch (Exception ex)
-                {
-                    if (ct.IsCancellationRequested) break;
-                    SetSource(ct, "Bluetooth: " + Innermost(ex).Message + " Retrying in 3 s…");
-                    try { await Task.Delay(3000, ct); } catch { break; }
-                }
-                finally
-                {
-                    try { if (dev != null) dev.Dispose(); } catch { }
-                }
+            }
+            finally
+            {
+                try { if (pairedSession != null) pairedSession.Dispose(); } catch { }
+                try { if (pairedDev != null) pairedDev.Dispose(); } catch { }
             }
         }
 
-        /// <summary>Opens a device object, giving up after 15 s. Returns null if it can't.</summary>
+        /// <summary>Asks Windows to keep the link to this device up and reconnect it automatically.</summary>
+        static async Task<GattSession> Maintain(BluetoothLEDevice dev, CancellationToken ct)
+        {
+            try
+            {
+                var s = await WinRt.Await(GattSession.FromDeviceIdAsync(dev.BluetoothDeviceId), ct);
+                if (s != null) s.MaintainConnection = true;
+                return s;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch { return null; }
+        }
+
+        static async Task<bool> WaitConnected(BluetoothLEDevice dev, TimeSpan max, CancellationToken ct)
+        {
+            var end = DateTime.UtcNow + max;
+            while (DateTime.UtcNow < end)
+            {
+                if (dev.ConnectionStatus == BluetoothConnectionStatus.Connected) return true;
+                await Task.Delay(1000, ct);
+            }
+            return dev.ConnectionStatus == BluetoothConnectionStatus.Connected;
+        }
+
         static async Task<BluetoothLEDevice> TryOpen(Func<Windows.Foundation.IAsyncOperation<BluetoothLEDevice>> open, CancellationToken ct)
         {
             using (var t = CancellationTokenSource.CreateLinkedTokenSource(ct))
@@ -878,9 +935,20 @@ namespace HeartRatePresence
                 BleLiveName = devName;
                 SetSource(ct, "Connected to " + devName + " over Bluetooth. Waiting for heart rate…");
                 Interlocked.Exchange(ref lastTicks, DateTime.UtcNow.Ticks);
+                int downSecs = 0;
                 while (!ct.IsCancellationRequested)
                 {
                     await Task.Delay(1000, ct);
+                    // the link itself dropped (walked out of range): hand back to the reconnect logic right away
+                    if (dev.ConnectionStatus == BluetoothConnectionStatus.Disconnected)
+                    {
+                        if (++downSecs >= 3)
+                        {
+                            SetSource(ct, devName + " went out of range. Reconnecting when it's back…");
+                            break;
+                        }
+                    }
+                    else downSecs = 0;
                     if ((DateTime.UtcNow - new DateTime(Interlocked.Read(ref lastTicks))).TotalSeconds > 20)
                     {
                         SetSource(ct, devName + " stopped sending. Reconnecting…");
@@ -2721,6 +2789,31 @@ namespace HeartRatePresence
                 }
             }
             catch (Exception ex) { log.AppendLine("bluetooth scan unavailable here: " + ex.Message + " (not a failure; build servers have no Bluetooth)"); }
+
+            // a paired device (only when this PC has one): open it the way the app does and ask Windows to keep it connected
+            try
+            {
+                string w0;
+                var real = AppConfig.Load(out w0);
+                if (!string.IsNullOrEmpty(real.BlePairedId))
+                {
+                    var pd = WinRt.Await(BluetoothLEDevice.FromIdAsync(real.BlePairedId), CancellationToken.None).Result;
+                    if (pd == null) log.AppendLine("paired device: Windows could not open it");
+                    else
+                    {
+                        using (pd)
+                        {
+                            var gs = WinRt.Await(GattSession.FromDeviceIdAsync(pd.BluetoothDeviceId), CancellationToken.None).Result;
+                            if (gs != null) gs.MaintainConnection = true;
+                            log.AppendLine("paired device: " + real.BlePairedName + ", Windows says " + pd.ConnectionStatus + ", keep-connected " + (gs != null && gs.MaintainConnection ? "ON" : "failed"));
+                            check(gs != null && gs.MaintainConnection, "keep-connected can be switched on for the paired device");
+                            if (gs != null) gs.Dispose();
+                        }
+                    }
+                }
+                else log.AppendLine("paired device: none on this PC, skipped");
+            }
+            catch (Exception ex) { log.AppendLine("paired device check skipped: " + (ex.InnerException ?? ex).Message); }
 
             // HypeRate with a bogus key: proves the websocket/TLS path to app.hyperate.io works and errors are readable
             var e4 = new Engine();
